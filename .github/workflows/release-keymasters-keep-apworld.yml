@@ -1,39 +1,58 @@
+```yaml
 name: Build keymasters_keep.apworld
 
 on:
   push:
     tags:
       - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build or repair, for example 1.0.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
-  # Must match the CPython minor version used by the target Archipelago client.
-  PYTHON_VERSION: '3.12'
+  # Match the Python 3.12 version used by the Archipelago release workflow.
+  PYTHON_VERSION: '~3.12.7'
 
 jobs:
   build-apworld:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout tagged commit
-        uses: actions/checkout@v4
-
-      - name: Verify strict X.Y.Z tag format
+      - name: Resolve release tag
+        id: release
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid tag '${GITHUB_REF_NAME}'. Expected X.Y.Z, for example 1.2.3"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid tag '$TAG'. Expected X.Y.Z, for example 1.2.3"
             exit 1
           fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
 
       - name: Select Python version
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: true
 
       - name: Build ZIP and rename it as .apworld
         shell: bash
@@ -46,7 +65,7 @@ jobs:
           # Preserve keymasters_keep/ as the root directory inside the archive.
           cp -a worlds/keymasters_keep build/keymasters_keep
 
-          # Remove old bytecode and regenerate it with the selected Python version.
+          # Remove old bytecode and regenerate it with Python 3.12.
           find build/keymasters_keep -type d -name '__pycache__' -prune -exec rm -rf '{}' +
           find build/keymasters_keep -type f -name '*.pyc' -delete
 
@@ -120,24 +139,18 @@ jobs:
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: keymasters_keep-${{ github.ref_name }}
+          name: keymasters_keep-${{ steps.release.outputs.tag }}
           path: dist/keymasters_keep.apworld
           if-no-files-found: error
 
-      - name: Create or update GitHub Release
+      - name: Attach APWorld to GitHub Release
+        uses: softprops/action-gh-release@975c1b265e11dd76618af1c374e7981f9a6ff44a
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          draft: true
+          prerelease: false
+          files: dist/keymasters_keep.apworld
+          overwrite_files: true
+          fail_on_unmatched_files: true
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TAG="${GITHUB_REF_NAME}"
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/keymasters_keep.apworld --clobber
-          else
-            gh release create "$TAG" dist/keymasters_keep.apworld \
-              --verify-tag \
-              --title "Keymaster's Keep $TAG" \
-              --generate-notes
-          fi
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
