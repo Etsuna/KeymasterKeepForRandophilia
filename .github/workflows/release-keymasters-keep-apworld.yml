@@ -1,0 +1,143 @@
+name: Build keymasters_keep.apworld
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  # Must match the CPython minor version used by the target Archipelago client.
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  build-apworld:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+
+      - name: Verify strict X.Y.Z tag format
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid tag '${GITHUB_REF_NAME}'. Expected X.Y.Z, for example 1.2.3"
+            exit 1
+          fi
+
+      - name: Select Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build ZIP and rename it as .apworld
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf build dist
+          mkdir -p build dist
+
+          # Preserve keymasters_keep/ as the root directory inside the archive.
+          cp -a worlds/keymasters_keep build/keymasters_keep
+
+          # Remove old bytecode and regenerate it with the selected Python version.
+          find build/keymasters_keep -type d -name '__pycache__' -prune -exec rm -rf '{}' +
+          find build/keymasters_keep -type f -name '*.pyc' -delete
+
+          # Default compileall layout:
+          # module.py -> __pycache__/module.cpython-312.pyc
+          python -m compileall -f -q build/keymasters_keep
+
+          # Create keymasters_keep.zip containing the keymasters_keep/ directory,
+          # then rename the ZIP archive as keymasters_keep.apworld.
+          python - <<'PY'
+          import shutil
+
+          shutil.make_archive(
+              base_name="dist/keymasters_keep",
+              format="zip",
+              root_dir="build",
+              base_dir="keymasters_keep",
+          )
+          PY
+
+          mv dist/keymasters_keep.zip dist/keymasters_keep.apworld
+
+      - name: Validate APWorld archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          archive = Path("dist/keymasters_keep.apworld")
+          expected_pyc_suffix = (
+              f".cpython-{sys.version_info.major}{sys.version_info.minor}.pyc"
+          )
+
+          with zipfile.ZipFile(archive) as apworld:
+              names = apworld.namelist()
+
+          print("Archive contents:")
+          for name in names:
+              print(name)
+
+          invalid_paths = [
+              name for name in names
+              if name != "keymasters_keep"
+              and not name.startswith("keymasters_keep/")
+          ]
+          if invalid_paths:
+              raise SystemExit(
+                  "Invalid archive paths outside keymasters_keep/: "
+                  + ", ".join(invalid_paths)
+              )
+
+          if not any(name.endswith(".py") for name in names):
+              raise SystemExit("The archive must keep the .py source files")
+
+          if not any(
+              "/__pycache__/" in name and name.endswith(expected_pyc_suffix)
+              for name in names
+          ):
+              raise SystemExit(
+                  "The archive must contain bytecode under __pycache__/ "
+                  f"with suffix {expected_pyc_suffix}"
+              )
+
+          print(f"Validated: {archive}")
+          PY
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keymasters_keep-${{ github.ref_name }}
+          path: dist/keymasters_keep.apworld
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/keymasters_keep.apworld --clobber
+          else
+            gh release create "$TAG" dist/keymasters_keep.apworld \
+              --verify-tag \
+              --title "Keymaster's Keep $TAG" \
+              --generate-notes
+          fi
